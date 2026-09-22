@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>BG Audio Test</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 12px 16px; font: 15px/1.5 system-ui, sans-serif; background: #1a1c20; color: #ddd; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  fieldset { border: 1px solid #444; border-radius: 6px; margin: 0 0 10px; padding: 8px 12px; }
+  legend { color: #9cf; }
+  label { display: block; padding: 4px 0; }
+  button { font: inherit; padding: 10px 18px; margin: 4px 6px 4px 0; border-radius: 6px; border: 1px solid #666; background: #2b2e34; color: #eee; }
+  button:disabled { opacity: 0.4; }
+  #status { font-family: ui-monospace, monospace; white-space: pre-wrap; background: #101214; padding: 8px; border-radius: 6px; margin: 8px 0; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; background: #101214; padding: 8px; border-radius: 6px; max-height: 45vh; overflow: auto; }
+  .gap { color: #f77; }
+  .ok { color: #7f7; }
+  .ev { color: #fd7; }
+  small { color: #999; }
+</style>
+</head>
+<body>
+<h1>裏画面オーディオ試験</h1>
+<p><small>方式を選んで「開始」。メロディが0.5秒ごとに変わるので、裏画面/ロック画面で「止まる」「同じ音で固まる」「鳴り続ける」を耳で判別する。戻ってきたらログに空白(gap)が出る。</small></p>
+
+<fieldset>
+  <legend>音を作る場所(producer)</legend>
+  <label><input type="radio" name="src" value="sp" checked> A. ScriptProcessorNode(メインスレッド) = 今のアプリと同じ</label>
+  <label><input type="radio" name="src" value="wfeed"> B. AudioWorklet に メインスレッドがバッファを送る(リングバッファ)</label>
+  <label><input type="radio" name="src" value="wself"> C. AudioWorklet の中だけで作る(メインスレッド不要)</label>
+</fieldset>
+<fieldset>
+  <legend>出口(sink)</legend>
+  <label><input type="radio" name="sink" value="direct" checked> 1. ctx.destination へ直結</label>
+  <label><input type="radio" name="sink" value="audio"> 2. MediaStreamDestination → &lt;audio&gt; 要素で再生(+Media Session)</label>
+</fieldset>
+
+<button id="start">開始</button>
+<button id="stop" disabled>停止</button>
+<button id="clear">ログ消去</button>
+<button id="copy">ログをコピー</button>
+
+<div id="status">未開始</div>
+<div id="log"></div>
+<audio id="aud" playsinline style="display:none"></audio>
+
+<script>
+(function () {
+  'use strict';
+  var logEl = document.getElementById('log');
+  var statusEl = document.getElementById('status');
+  var lines = [];
+  var t0 = 0;
+  function now() { return Date.now(); }
+  function fmt(ms) { return (ms / 1000).toFixed(2).padStart(7); }
+  function log(msg, cls) {
+    var line = fmt(now() - t0) + '  ' + msg;
+    lines.push({ t: now(), s: line, c: cls || '' });
+    if (lines.length > 400) lines.shift();
+    render();
+  }
+  function render() {
+    if (document.hidden) return; // 隠れている間は描かない(戻ったときにまとめて)
+    var html = '';
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i];
+      var s = l.s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+      html += l.c ? '<span class="' + l.c + '">' + s + '</span>\n' : s + '\n';
+    }
+    logEl.innerHTML = html;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ---- メロディ生成(メインスレッド用。Worklet内にも同じものをASCIIで持つ) ----
+  var MELODY = [60, 64, 67, 72, 67, 64, 60, 55];
+  function makeGen(sampleRate) {
+    var phase = 0, pos = 0, step = 0;
+    var stepLen = Math.floor(sampleRate * 0.5);
+    return function (out) {
+      for (var i = 0; i < out.length; i++) {
+        var m = MELODY[step % MELODY.length];
+        var f = 440 * Math.pow(2, (m - 69) / 12);
+        phase += f / sampleRate; if (phase >= 1) phase -= 1;
+        out[i] = (phase < 0.25 ? 0.15 : -0.15); // 矩形波(duty 25%)
+        if (++pos >= stepLen) { pos = 0; step++; }
+      }
+    };
+  }
+
+  // ---- Worklet プロセッサ(data: URL で読むので本文はASCIIのみ) ----
+  var WORKLET_SRC = [
+    "class BgGen extends AudioWorkletProcessor {",
+    "  constructor(o) {",
+    "    super();",
+    "    this.mode = o.processorOptions.mode;",
+    "    this.melody = [60,64,67,72,67,64,60,55];",
+    "    this.phase = 0; this.pos = 0; this.step = 0; this.stepLen = Math.floor(sampleRate * 0.5);",
+    "    this.ring = new Float32Array(65536); this.rw = 0; this.rr = 0; this.pending = 0;",
+    "    this.blocks = 0; this.underrun = 0; this.lastReport = 0;",
+    "    this.port.onmessage = (e) => {",
+    "      var b = e.data.buf; if (!b) return;",
+    "      for (var i = 0; i < b.length; i++) { this.ring[this.rw] = b[i]; this.rw = (this.rw + 1) & 65535; }",
+    "      this.pending -= b.length; if (this.pending < 0) this.pending = 0;",
+    "    };",
+    "  }",
+    "  avail() { return (this.rw - this.rr) & 65535; }",
+    "  process(inputs, outputs) {",
+    "    var out = outputs[0][0]; if (!out) return true;",
+    "    if (this.mode === 'self') {",
+    "      for (var i = 0; i < out.length; i++) {",
+    "        var m = this.melody[this.step % this.melody.length];",
+    "        var f = 440 * Math.pow(2, (m - 69) / 12);",
+    "        this.phase += f / sampleRate; if (this.phase >= 1) this.phase -= 1;",
+    "        out[i] = (this.phase < 0.25 ? 0.15 : -0.15);",
+    "        if (++this.pos >= this.stepLen) { this.pos = 0; this.step++; }",
+    "      }",
+    "    } else {",
+    "      for (var j = 0; j < out.length; j++) {",
+    "        if (this.rr !== this.rw) { out[j] = this.ring[this.rr]; this.rr = (this.rr + 1) & 65535; }",
+    "        else { out[j] = 0; this.underrun++; }",
+    "      }",
+    "      if (this.avail() + this.pending < 16384) { this.pending += 4096; this.port.postMessage({ need: 4096 }); }",
+    "    }",
+    "    this.blocks++;",
+    "    if (currentTime - this.lastReport >= 1) {",
+    "      this.lastReport = currentTime;",
+    "      this.port.postMessage({ report: { blocks: this.blocks, underrun: this.underrun, avail: this.avail(), ct: currentTime } });",
+    "    }",
+    "    return true;",
+    "  }",
+    "}",
+    "registerProcessor('bg-gen', BgGen);"
+  ].join('\n');
+
+  var ctx = null, node = null, gen = null, sinkNode = null, running = false;
+  var aud = document.getElementById('aud');
+  var producerCalls = 0, producerCallsLast = 0, lastHeartbeat = 0, workletReport = null;
+  var heartbeatTimer = null;
+
+  function selected(name) {
+    var els = document.getElementsByName(name);
+    for (var i = 0; i < els.length; i++) if (els[i].checked) return els[i].value;
+    return null;
+  }
+
+  function setStatus() {
+    var s = [];
+    s.push('方式: producer=' + selected('src') + ' sink=' + selected('sink'));
+    s.push('secureContext=' + window.isSecureContext + '  visibility=' + document.visibilityState + '  standalone=' + (navigator.standalone === true || matchMedia('(display-mode: standalone)').matches));
+    if (ctx) s.push('ctx.state=' + ctx.state + '  currentTime=' + ctx.currentTime.toFixed(1) + '  sampleRate=' + ctx.sampleRate);
+    if (workletReport) s.push('worklet: blocks=' + workletReport.blocks + ' underrun=' + workletReport.underrun + ' avail=' + workletReport.avail);
+    s.push('producer 呼び出し/秒(直近)=' + producerCallsLast);
+    if (selected('sink') === 'audio') s.push('audio: paused=' + aud.paused + ' readyState=' + aud.readyState);
+    statusEl.textContent = s.join('\n');
+  }
+
+  function b64utf8(str) {
+    var bytes = new TextEncoder().encode(str), bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  async function start() {
+    if (running) return;
+    t0 = now();
+    lines = [];
+    var src = selected('src'), sink = selected('sink');
+    log('start: producer=' + src + ' sink=' + sink + ' UA=' + navigator.userAgent, 'ev');
+    try {
+      if (!ctx) {
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        ctx.onstatechange = function () { log('ctx.statechange -> ' + ctx.state, 'ev'); setStatus(); };
+      }
+      if (ctx.state === 'suspended') await ctx.resume();
+      log('ctx.state=' + ctx.state + ' sr=' + ctx.sampleRate);
+
+      // producer
+      gen = makeGen(ctx.sampleRate);
+      producerCalls = 0;
+      if (src === 'sp') {
+        node = ctx.createScriptProcessor(4096, 0, 1);
+        node.onaudioprocess = function (e) { producerCalls++; gen(e.outputBuffer.getChannelData(0)); };
+      } else {
+        if (!ctx.audioWorklet) throw new Error('AudioWorklet が無い');
+        var url = 'data:application/javascript;base64,' + b64utf8(WORKLET_SRC);
+        await ctx.audioWorklet.addModule(url);
+        log('worklet addModule OK (data: URL)', 'ok');
+        node = new AudioWorkletNode(ctx, 'bg-gen', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1], processorOptions: { mode: src === 'wself' ? 'self' : 'feed' } });
+        node.port.onmessage = function (e) {
+          var d = e.data;
+          if (d.need) {
+            producerCalls++;
+            var buf = new Float32Array(d.need);
+            gen(buf);
+            node.port.postMessage({ buf: buf }, [buf.buffer]);
+          } else if (d.report) {
+            workletReport = d.report;
+          }
+        };
+        if (src === 'wfeed') {
+          // 先読み: Worklet からの最初の要求を待つと頭で数百サンプルのアンダーランが出るので、先に3本送っておく
+          for (var k = 0; k < 3; k++) { var pre = new Float32Array(4096); gen(pre); node.port.postMessage({ buf: pre }, [pre.buffer]); }
+        }
+      }
+
+      // sink
+      if (sink === 'audio') {
+        sinkNode = ctx.createMediaStreamDestination();
+        node.connect(sinkNode);
+        aud.srcObject = sinkNode.stream;
+        aud.onplay = function () { log('audio.play', 'ev'); };
+        aud.onpause = function () { log('audio.pause', 'ev'); };
+        aud.onstalled = function () { log('audio.stalled', 'ev'); };
+        aud.onended = function () { log('audio.ended', 'ev'); };
+        await aud.play();
+        log('audio element playing', 'ok');
+        if ('mediaSession' in navigator) {
+          navigator.mediaSession.metadata = new MediaMetadata({ title: 'BG Audio Test', artist: 'producer=' + src, album: 'sink=audio' });
+          navigator.mediaSession.setActionHandler('play', function () { log('mediaSession play', 'ev'); aud.play(); ctx.resume(); });
+          navigator.mediaSession.setActionHandler('pause', function () { log('mediaSession pause', 'ev'); });
+          try { navigator.mediaSession.playbackState = 'playing'; } catch (e) {}
+          log('mediaSession set', 'ok');
+        }
+      } else {
+        node.connect(ctx.destination);
+      }
+
+      running = true;
+      document.getElementById('start').disabled = true;
+      document.getElementById('stop').disabled = false;
+      lastHeartbeat = now();
+      heartbeatTimer = setInterval(heartbeat, 1000);
+      log('running', 'ok');
+    } catch (e) {
+      log('ERROR: ' + (e && e.message ? e.message : e), 'gap');
+      stop();
+    }
+    setStatus();
+  }
+
+  function heartbeat() {
+    var t = now(), gap = t - lastHeartbeat;
+    lastHeartbeat = t;
+    producerCallsLast = producerCalls; producerCalls = 0;
+    var msg = 'hb calls/s=' + producerCallsLast + ' ctx=' + (ctx ? ctx.state : '-') + ' ct=' + (ctx ? ctx.currentTime.toFixed(1) : '-') + ' vis=' + document.visibilityState;
+    if (workletReport) msg += ' wl.blocks=' + workletReport.blocks + ' ur=' + workletReport.underrun;
+    if (gap > 1500) log('GAP ' + (gap / 1000).toFixed(1) + 's (メインスレッドのタイマーが止まっていた) ' + msg, 'gap');
+    else log(msg);
+    setStatus();
+  }
+
+  function stop() {
+    running = false;
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    try { if (node) node.disconnect(); } catch (e) {}
+    if (node && node.port) node.port.onmessage = null;
+    if (node && node.onaudioprocess !== undefined) node.onaudioprocess = null;
+    node = null;
+    try { aud.pause(); aud.srcObject = null; } catch (e) {}
+    sinkNode = null;
+    workletReport = null;
+    document.getElementById('start').disabled = false;
+    document.getElementById('stop').disabled = true;
+    log('stopped', 'ev');
+    setStatus();
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    log('visibilitychange -> ' + document.visibilityState + (ctx ? ' ctx=' + ctx.state : ''), 'ev');
+    if (!document.hidden) render();
+  });
+  window.addEventListener('pagehide', function () { log('pagehide', 'ev'); });
+  window.addEventListener('pageshow', function () { log('pageshow', 'ev'); });
+  window.addEventListener('focus', function () { log('window.focus', 'ev'); });
+  window.addEventListener('blur', function () { log('window.blur', 'ev'); });
+
+  document.getElementById('start').addEventListener('click', start);
+  document.getElementById('stop').addEventListener('click', stop);
+  document.getElementById('clear').addEventListener('click', function () { lines = []; render(); });
+  document.getElementById('copy').addEventListener('click', function () {
+    var txt = lines.map(function (l) { return l.s; }).join('\n');
+    if (navigator.clipboard) navigator.clipboard.writeText(txt).then(function () { log('copied', 'ok'); }, function () { log('copy failed', 'gap'); });
+  });
+  setStatus();
+})();
+</script>
+</body>
+</html>

@@ -37,6 +37,7 @@
   <legend>出口(sink)</legend>
   <label><input type="radio" name="sink" value="direct" checked> 1. ctx.destination へ直結</label>
   <label><input type="radio" name="sink" value="audio"> 2. MediaStreamDestination → &lt;audio&gt; 要素で再生(+Media Session)</label>
+  <label><input type="radio" name="sink" value="silent"> 3. ctx.destination へ直結 + 無音WAVをループ再生する &lt;audio&gt; を添える(+Media Session)</label>
 </fieldset>
 
 <button id="start">開始</button>
@@ -54,7 +55,7 @@
   var logEl = document.getElementById('log');
   var statusEl = document.getElementById('status');
   var lines = [];
-  var t0 = 0;
+  var t0 = Date.now();
   function now() { return Date.now(); }
   function fmt(ms) { return (ms / 1000).toFixed(2).padStart(7); }
   function log(msg, cls) {
@@ -137,6 +138,34 @@
   ].join('\n');
 
   var ctx = null, node = null, gen = null, sinkNode = null, running = false;
+  var FAKE_DUR = 300, fakePos = 0; // ロック画面のシークバー用の見せかけの位置(秒)
+  var silentUrlCache = null;
+  function silentWavUrl(seconds) {
+    if (silentUrlCache) return silentUrlCache;
+    var sr = 8000, n = sr * seconds, buf = new Uint8Array(44 + n), dv = new DataView(buf.buffer);
+    var str = function (off, txt) { for (var i = 0; i < txt.length; i++) buf[off + i] = txt.charCodeAt(i); };
+    str(0, 'RIFF'); dv.setUint32(4, 36 + n, true); str(8, 'WAVE');
+    str(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, sr, true); dv.setUint32(28, sr, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);
+    str(36, 'data'); dv.setUint32(40, n, true);
+    buf.fill(0x80, 44);
+    var bin = '';
+    for (var i = 0; i < buf.length; i += 8192) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 8192));
+    silentUrlCache = 'data:audio/wav;base64,' + btoa(bin);
+    return silentUrlCache;
+  }
+  // Media Session の操作は「ページ読み込み時」に全部登録しておく(本番アプリと同じ順序)
+  if ('mediaSession' in navigator) {
+    var ms = navigator.mediaSession;
+    var bind = function (act, fn) { try { ms.setActionHandler(act, fn); log('bound ' + act, 'ok'); } catch (e) { log('bind ' + act + ' unsupported: ' + e.message, 'gap'); } };
+    bind('play', function () { log('mediaSession play', 'ev'); if (ctx) ctx.resume(); aud.play(); try { ms.playbackState = 'playing'; } catch (e) {} });
+    bind('pause', function () { log('mediaSession pause (音は止めない。ログだけ)', 'ev'); try { ms.playbackState = 'paused'; } catch (e) {} });
+    bind('previoustrack', function () { log('mediaSession previoustrack', 'ev'); });
+    bind('nexttrack', function () { log('mediaSession nexttrack', 'ev'); });
+    bind('seekbackward', function (d) { log('mediaSession seekbackward offset=' + (d && d.seekOffset), 'ev'); fakePos = Math.max(0, fakePos - 10); });
+    bind('seekforward', function (d) { log('mediaSession seekforward offset=' + (d && d.seekOffset), 'ev'); fakePos = Math.min(FAKE_DUR, fakePos + 10); });
+    bind('seekto', function (d) { log('mediaSession seekto time=' + (d && d.seekTime) + ' fast=' + (d && d.fastSeek), 'ev'); if (d && typeof d.seekTime === 'number') fakePos = d.seekTime; });
+  }
   var aud = document.getElementById('aud');
   var producerCalls = 0, producerCallsLast = 0, lastHeartbeat = 0, workletReport = null;
   var heartbeatTimer = null;
@@ -154,7 +183,7 @@
     if (ctx) s.push('ctx.state=' + ctx.state + '  currentTime=' + ctx.currentTime.toFixed(1) + '  sampleRate=' + ctx.sampleRate);
     if (workletReport) s.push('worklet: blocks=' + workletReport.blocks + ' underrun=' + workletReport.underrun + ' avail=' + workletReport.avail);
     s.push('producer 呼び出し/秒(直近)=' + producerCallsLast);
-    if (selected('sink') === 'audio') s.push('audio: paused=' + aud.paused + ' readyState=' + aud.readyState);
+    if (selected('sink') !== 'direct') s.push('audio: paused=' + aud.paused + ' readyState=' + aud.readyState + ' duration=' + aud.duration);
     statusEl.textContent = s.join('\n');
   }
 
@@ -208,10 +237,18 @@
       }
 
       // sink
-      if (sink === 'audio') {
-        sinkNode = ctx.createMediaStreamDestination();
-        node.connect(sinkNode);
-        aud.srcObject = sinkNode.stream;
+      if (sink === 'audio' || sink === 'silent') {
+        if (sink === 'audio') {
+          sinkNode = ctx.createMediaStreamDestination();
+          node.connect(sinkNode);
+          aud.srcObject = sinkNode.stream;
+          aud.loop = false;
+        } else {
+          node.connect(ctx.destination);
+          aud.srcObject = null;
+          aud.src = silentWavUrl(6);
+          aud.loop = true;
+        }
         aud.onplay = function () { log('audio.play', 'ev'); };
         aud.onpause = function () { log('audio.pause', 'ev'); };
         aud.onstalled = function () { log('audio.stalled', 'ev'); };
@@ -219,11 +256,10 @@
         await aud.play();
         log('audio element playing', 'ok');
         if ('mediaSession' in navigator) {
-          navigator.mediaSession.metadata = new MediaMetadata({ title: 'BG Audio Test', artist: 'producer=' + src, album: 'sink=audio' });
-          navigator.mediaSession.setActionHandler('play', function () { log('mediaSession play', 'ev'); aud.play(); ctx.resume(); });
-          navigator.mediaSession.setActionHandler('pause', function () { log('mediaSession pause', 'ev'); });
+          navigator.mediaSession.metadata = new MediaMetadata({ title: 'BG Audio Test', artist: 'producer=' + src, album: 'sink=' + sink });
           try { navigator.mediaSession.playbackState = 'playing'; } catch (e) {}
-          log('mediaSession set', 'ok');
+          fakePos = 0;
+          log('mediaSession metadata set (handlers were bound at load)', 'ok');
         }
       } else {
         node.connect(ctx.destination);
@@ -248,6 +284,10 @@
     producerCallsLast = producerCalls; producerCalls = 0;
     var msg = 'hb calls/s=' + producerCallsLast + ' ctx=' + (ctx ? ctx.state : '-') + ' ct=' + (ctx ? ctx.currentTime.toFixed(1) : '-') + ' vis=' + document.visibilityState;
     if (workletReport) msg += ' wl.blocks=' + workletReport.blocks + ' ur=' + workletReport.underrun;
+    if (running && ('mediaSession' in navigator) && navigator.mediaSession.setPositionState) {
+      fakePos = Math.min(FAKE_DUR, fakePos + 1);
+      try { navigator.mediaSession.setPositionState({ duration: FAKE_DUR, position: fakePos, playbackRate: 1 }); } catch (e) { log('setPositionState error ' + e.message, 'gap'); }
+    }
     if (gap > 1500) log('GAP ' + (gap / 1000).toFixed(1) + 's (メインスレッドのタイマーが止まっていた) ' + msg, 'gap');
     else log(msg);
     setStatus();

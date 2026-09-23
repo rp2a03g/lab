@@ -40,6 +40,12 @@
   <label><input type="radio" name="sink" value="silent"> 3. ctx.destination へ直結 + 無音WAVをループ再生する &lt;audio&gt; を添える(+Media Session)</label>
 </fieldset>
 
+<fieldset>
+  <legend>Media Session に登録する操作(開始時に登録、停止で解除)</legend>
+  <label><input type="checkbox" id="hPrevNext" checked> 前の曲/次の曲(previoustrack/nexttrack)</label>
+  <label><input type="checkbox" id="hSeek" checked> 10秒送り/戻し(seekforward/seekbackward)</label>
+  <label><input type="checkbox" id="hSeekTo" checked> 位置指定(seekto)+シークバー(setPositionState)</label>
+</fieldset>
 <button id="start">開始</button>
 <button id="stop" disabled>停止</button>
 <button id="clear">ログ消去</button>
@@ -62,8 +68,14 @@
     var line = fmt(now() - t0) + '  ' + msg;
     lines.push({ t: now(), s: line, c: cls || '' });
     if (lines.length > 400) lines.shift();
+    try { localStorage.setItem('bgtest_log', JSON.stringify(lines.slice(-60).map(function (l) { return l.s; }))); } catch (e) {}
     render();
   }
+  // 前回(強制終了した回を含む)のログを最初に出す。visibilitychange/pagehide が終了時に出たかを見るため
+  try {
+    var prev = JSON.parse(localStorage.getItem('bgtest_log') || '[]');
+    if (prev.length) { lines.push({ t: 0, s: '---- 前回のログ(最後の' + prev.length + '行) ----', c: 'ev' }); prev.forEach(function (x) { lines.push({ t: 0, s: '  ' + x, c: '' }); }); lines.push({ t: 0, s: '---- ここから今回 ----', c: 'ev' }); }
+  } catch (e) {}
   function render() {
     if (document.hidden) return; // 隠れている間は描かない(戻ったときにまとめて)
     var html = '';
@@ -154,17 +166,32 @@
     silentUrlCache = 'data:audio/wav;base64,' + btoa(bin);
     return silentUrlCache;
   }
-  // Media Session の操作は「ページ読み込み時」に全部登録しておく(本番アプリと同じ順序)
-  if ('mediaSession' in navigator) {
+  // Media Session の操作は開始時(要素を鳴らす前)にチェックボックスの組み合わせで登録し、停止で解除する。
+  // iOS のロック画面が「前後の曲」と「10秒送り」のどちらを出すかが登録の組み合わせで変わるかを見る
+  var ALL_ACTS = ['play', 'pause', 'previoustrack', 'nexttrack', 'seekbackward', 'seekforward', 'seekto'];
+  function bindMediaSession() {
+    if (!('mediaSession' in navigator)) { log('mediaSession 無し', 'gap'); return; }
     var ms = navigator.mediaSession;
+    ALL_ACTS.forEach(function (a) { try { ms.setActionHandler(a, null); } catch (e) {} });
     var bind = function (act, fn) { try { ms.setActionHandler(act, fn); log('bound ' + act, 'ok'); } catch (e) { log('bind ' + act + ' unsupported: ' + e.message, 'gap'); } };
     bind('play', function () { log('mediaSession play', 'ev'); if (ctx) ctx.resume(); aud.play(); try { ms.playbackState = 'playing'; } catch (e) {} });
     bind('pause', function () { log('mediaSession pause (音は止めない。ログだけ)', 'ev'); try { ms.playbackState = 'paused'; } catch (e) {} });
-    bind('previoustrack', function () { log('mediaSession previoustrack', 'ev'); });
-    bind('nexttrack', function () { log('mediaSession nexttrack', 'ev'); });
-    bind('seekbackward', function (d) { log('mediaSession seekbackward offset=' + (d && d.seekOffset), 'ev'); fakePos = Math.max(0, fakePos - 10); });
-    bind('seekforward', function (d) { log('mediaSession seekforward offset=' + (d && d.seekOffset), 'ev'); fakePos = Math.min(FAKE_DUR, fakePos + 10); });
-    bind('seekto', function (d) { log('mediaSession seekto time=' + (d && d.seekTime) + ' fast=' + (d && d.fastSeek), 'ev'); if (d && typeof d.seekTime === 'number') fakePos = d.seekTime; });
+    if (document.getElementById('hPrevNext').checked) {
+      bind('previoustrack', function () { log('mediaSession previoustrack', 'ev'); });
+      bind('nexttrack', function () { log('mediaSession nexttrack', 'ev'); });
+    }
+    if (document.getElementById('hSeek').checked) {
+      bind('seekbackward', function (d) { log('mediaSession seekbackward offset=' + (d && d.seekOffset), 'ev'); fakePos = Math.max(0, fakePos - 10); });
+      bind('seekforward', function (d) { log('mediaSession seekforward offset=' + (d && d.seekOffset), 'ev'); fakePos = Math.min(FAKE_DUR, fakePos + 10); });
+    }
+    if (document.getElementById('hSeekTo').checked) {
+      bind('seekto', function (d) { log('mediaSession seekto time=' + (d && d.seekTime) + ' fast=' + (d && d.fastSeek), 'ev'); if (d && typeof d.seekTime === 'number') fakePos = d.seekTime; });
+    }
+  }
+  function unbindMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+    ALL_ACTS.forEach(function (a) { try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {} });
+    try { navigator.mediaSession.playbackState = 'none'; } catch (e) {}
   }
   var aud = document.getElementById('aud');
   var producerCalls = 0, producerCallsLast = 0, lastHeartbeat = 0, workletReport = null;
@@ -236,6 +263,8 @@
         }
       }
 
+      // Media Session(要素を鳴らす前に登録)
+      if (sink !== 'direct') bindMediaSession();
       // sink
       if (sink === 'audio' || sink === 'silent') {
         if (sink === 'audio') {
@@ -259,7 +288,7 @@
           navigator.mediaSession.metadata = new MediaMetadata({ title: 'BG Audio Test', artist: 'producer=' + src, album: 'sink=' + sink });
           try { navigator.mediaSession.playbackState = 'playing'; } catch (e) {}
           fakePos = 0;
-          log('mediaSession metadata set (handlers were bound at load)', 'ok');
+          log('mediaSession metadata set', 'ok');
         }
       } else {
         node.connect(ctx.destination);
@@ -284,7 +313,7 @@
     producerCallsLast = producerCalls; producerCalls = 0;
     var msg = 'hb calls/s=' + producerCallsLast + ' ctx=' + (ctx ? ctx.state : '-') + ' ct=' + (ctx ? ctx.currentTime.toFixed(1) : '-') + ' vis=' + document.visibilityState;
     if (workletReport) msg += ' wl.blocks=' + workletReport.blocks + ' ur=' + workletReport.underrun;
-    if (running && ('mediaSession' in navigator) && navigator.mediaSession.setPositionState) {
+    if (running && document.getElementById('hSeekTo').checked && ('mediaSession' in navigator) && navigator.mediaSession.setPositionState) {
       fakePos = Math.min(FAKE_DUR, fakePos + 1);
       try { navigator.mediaSession.setPositionState({ duration: FAKE_DUR, position: fakePos, playbackRate: 1 }); } catch (e) { log('setPositionState error ' + e.message, 'gap'); }
     }
@@ -300,7 +329,8 @@
     if (node && node.port) node.port.onmessage = null;
     if (node && node.onaudioprocess !== undefined) node.onaudioprocess = null;
     node = null;
-    try { aud.pause(); aud.srcObject = null; } catch (e) {}
+    try { aud.pause(); aud.removeAttribute('src'); aud.srcObject = null; aud.load(); } catch (e) {}
+    unbindMediaSession();
     sinkNode = null;
     workletReport = null;
     document.getElementById('start').disabled = false;
@@ -313,7 +343,9 @@
     log('visibilitychange -> ' + document.visibilityState + (ctx ? ' ctx=' + ctx.state : ''), 'ev');
     if (!document.hidden) render();
   });
-  window.addEventListener('pagehide', function () { log('pagehide', 'ev'); });
+  window.addEventListener('pagehide', function (e) { log('pagehide persisted=' + e.persisted + ' running=' + running, 'ev'); });
+  window.addEventListener('beforeunload', function () { log('beforeunload running=' + running, 'ev'); });
+  window.addEventListener('unload', function () { log('unload running=' + running, 'ev'); });
   window.addEventListener('pageshow', function () { log('pageshow', 'ev'); });
   window.addEventListener('focus', function () { log('window.focus', 'ev'); });
   window.addEventListener('blur', function () { log('window.blur', 'ev'); });
